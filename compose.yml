@@ -1,9 +1,0 @@
-services:
-  navidrome:
-    image: ghcr.io/scottdkey/navidrome:latest
-    container_name: navidrome
-    restart: unless-stopped
-    ports:
-      - "4533:4533"
-    volumes:
-      - /opt/navidrome/config:/config
