@@ -1,0 +1,25 @@
+# Navidrome - Music Server
+# docs: ../../docs/services/navidrome.md
+
+services:
+  navidrome:
+    image: deluan/navidrome:${NAVIDROME_IMAGE_TAG:-latest}
+    container_name: navidrome
+    environment:
+      - TZ=${TZ:-America/Denver}
+      - ND_SCANSCHEDULE=1h
+      - ND_LOGLEVEL=info
+      - ND_SESSIONTIMEOUT=24h
+      - ND_BASEURL=
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4533"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "${NAVIDROME_PORT:-4533}:4533"
+    volumes:
+      - ${NAVIDROME_CONFIG_PATH:-/opt/appdata/navidrome}:/data
+      - ${MEDIA_PATH:-/mnt/pool/data/media}/music:/music:ro
+    restart: unless-stopped
