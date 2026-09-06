@@ -1,10 +1,14 @@
 //! Dynamic (subprocess) entrypoint for the navidrome plugin.
 //!
-//! The toolkit's `serve_service_plugin!` emits `fn main`, serving this plugin over the orca
-//! socket. The plugin is a
-//! `[[bin]]`, owns no runtime, and reaches orca only through the socket.
-plugin_toolkit::serve_service_plugin! {
-    name: "navidrome",
-    target_compat: "any",
-    backend: navidrome::NavidromeBackend::new("navidrome"),
+//! Builds the typed `Plugin` and serves it over the orca socket. The plugin is
+//! a `[[bin]]`, owns no runtime, and reaches orca only through the socket.
+plugin_toolkit::instrument::bootstrap!();
+use navidrome::NavidromeBackend;
+use plugin_toolkit::plugin::Plugin;
+
+fn main() -> plugin_toolkit::anyhow::Result<()> {
+    Plugin::named("navidrome")
+        .version(env!("CARGO_PKG_VERSION"))
+        .service(NavidromeBackend::new("navidrome"))
+        .serve()
 }
