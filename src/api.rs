@@ -1,9 +1,12 @@
 //! Navidrome's Subsonic REST API (`/rest/*.view`), authenticated with
-//! plaintext `u`/`p` query params and `f=json` for a JSON (not XML) body.
-//! Requests ride orca's `http.request` capability (`delegated-http`).
+//! Subsonic's legacy token scheme (`u`/`t`/`s`: `t = md5(password + salt)`,
+//! a fresh random `s` per request) and `f=json` for a JSON (not XML) body.
+//! The plaintext password never goes on the wire. Requests ride orca's
+//! `http.request` capability (`delegated-http`).
 
 #![allow(clippy::disallowed_types)]
 
+use crate::md5;
 use plugin_toolkit::api_client::ApiClientBuilder;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::progenitor_client::QueryParam;
@@ -108,10 +111,16 @@ impl Navidrome {
         format!("{}/rest/{endpoint}", self.base_url)
     }
 
+    /// Builds auth params per Subsonic's legacy token scheme: a fresh random
+    /// `s`(alt) each call, and `t` = `md5(password + salt)` in place of a
+    /// plaintext password.
     fn base_params(&self) -> Vec<(&'static str, String)> {
+        let salt = plugin_toolkit::mint_uuidv7();
+        let token = md5::hex(&format!("{}{salt}", self.password));
         vec![
             ("u", self.username.clone()),
-            ("p", self.password.clone()),
+            ("t", token),
+            ("s", salt),
             ("v", API_VERSION.to_string()),
             ("c", CLIENT_NAME.to_string()),
             ("f", "json".to_string()),
@@ -164,10 +173,10 @@ impl Navidrome {
 
     pub async fn music_folders(&self) -> Result<Vec<MusicFolder>> {
         let v = self.call("getMusicFolders.view", &[]).await?;
-        Ok(arr(&v["musicFolders"]["musicFolder"])
+        arr(&v["musicFolders"]["musicFolder"])
             .iter()
             .map(parse_music_folder)
-            .collect())
+            .collect()
     }
 
     /// Queue a library scan. `full_scan` reprocesses every file instead of
@@ -200,7 +209,7 @@ impl Navidrome {
         for idx in arr(&v["artists"]["index"]) {
             for a in arr(&idx["artist"]) {
                 out.push(ArtistEntry {
-                    id: id_of(&a["id"]),
+                    id: id_of(&a["id"])?,
                     name: str_of(&a["name"]),
                 });
             }
@@ -216,49 +225,61 @@ impl Navidrome {
         Ok(SearchResult {
             artists: arr(&r["artist"])
                 .iter()
-                .map(|a| ArtistEntry {
-                    id: id_of(&a["id"]),
-                    name: str_of(&a["name"]),
+                .map(|a| {
+                    Ok(ArtistEntry {
+                        id: id_of(&a["id"])?,
+                        name: str_of(&a["name"]),
+                    })
                 })
-                .collect(),
+                .collect::<Result<_>>()?,
             albums: arr(&r["album"])
                 .iter()
-                .map(|a| AlbumEntry {
-                    id: id_of(&a["id"]),
-                    name: str_of(&a["name"]),
+                .map(|a| {
+                    Ok(AlbumEntry {
+                        id: id_of(&a["id"])?,
+                        name: str_of(&a["name"]),
+                    })
                 })
-                .collect(),
+                .collect::<Result<_>>()?,
             songs: arr(&r["song"])
                 .iter()
-                .map(|s| SongEntry {
-                    id: id_of(&s["id"]),
-                    title: str_of(&s["title"]),
+                .map(|s| {
+                    Ok(SongEntry {
+                        id: id_of(&s["id"])?,
+                        title: str_of(&s["title"]),
+                    })
                 })
-                .collect(),
+                .collect::<Result<_>>()?,
         })
     }
 }
 
-/// Subsonic music-folder ids are plain integers on the wire.
-fn id_of(v: &Value) -> String {
+/// Subsonic ids are a string on the wire for most endpoints but plain
+/// integers for music folders — accept either, but a response with neither
+/// shape is a decode error, not an empty id.
+fn id_of(v: &Value) -> Result<String> {
     match v {
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
-        _ => String::new(),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::String(s) => Ok(s.clone()),
+        _ => bail!("expected an id (string or number), got {v}"),
     }
 }
 
-fn parse_music_folder(v: &Value) -> MusicFolder {
-    MusicFolder {
-        id: id_of(&v["id"]),
+fn parse_music_folder(v: &Value) -> Result<MusicFolder> {
+    Ok(MusicFolder {
+        id: id_of(&v["id"])?,
         name: str_of(&v["name"]),
-    }
+    })
 }
 
 fn parse_scan_status(v: &Value) -> Result<ScanStatus> {
     Ok(ScanStatus {
-        scanning: v["scanning"].as_bool().unwrap_or(false),
-        count: v["count"].as_i64().unwrap_or(0),
+        scanning: v["scanning"]
+            .as_bool()
+            .ok_or_else(|| anyhow!("scanStatus: missing or non-bool `scanning`"))?,
+        count: v["count"]
+            .as_i64()
+            .ok_or_else(|| anyhow!("scanStatus: missing or non-integer `count`"))?,
     })
 }
 
@@ -345,6 +366,15 @@ mod tests {
         Navidrome::new("http://nav.test/", "admin", "s3cret", false).unwrap()
     }
 
+    /// Pulls a query param's value out of a captured wire path.
+    fn param<'a>(path: &'a str, name: &str) -> Option<&'a str> {
+        let query = path.split('?').nth(1)?;
+        query.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == name).then_some(v)
+        })
+    }
+
     #[test]
     fn server_info_parses_ping_response() {
         let calls = serve(
@@ -362,8 +392,33 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert!(calls[0].1.contains("u=admin"), "{calls:?}");
-        assert!(calls[0].1.contains("p=s3cret"), "{calls:?}");
+        assert!(!calls[0].1.contains("p=s3cret"), "{calls:?}");
+        assert!(!calls[0].1.contains("s3cret"), "{calls:?}");
         assert!(calls[0].1.contains("f=json"), "{calls:?}");
+
+        let salt = param(&calls[0].1, "s").expect("s present");
+        let token = param(&calls[0].1, "t").expect("t present");
+        assert_eq!(token, md5::hex(&format!("s3cret{salt}")));
+    }
+
+    #[test]
+    fn consecutive_calls_use_different_salts() {
+        let calls = serve(
+            "/rest/ping.view",
+            json!({"subsonic-response": {
+                "status": "ok", "version": "1.16.1", "type": "navidrome",
+                "serverVersion": "0.52.0", "openSubsonic": true
+            }}),
+            || {
+                let n = nav();
+                block(n.server_info()).unwrap();
+                block(n.server_info()).unwrap();
+            },
+        );
+        assert_eq!(calls.len(), 2);
+        let salt_a = param(&calls[0].1, "s").expect("s present");
+        let salt_b = param(&calls[1].1, "s").expect("s present");
+        assert_ne!(salt_a, salt_b, "{calls:?}");
     }
 
     #[test]
@@ -552,6 +607,36 @@ mod tests {
                 assert!(r.artists.is_empty());
                 assert!(r.albums.is_empty());
                 assert!(r.songs.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn scan_status_errors_when_scanning_field_is_missing() {
+        serve(
+            "/rest/getScanStatus.view",
+            json!({"subsonic-response": {"status": "ok", "version": "1.16.1",
+                "scanStatus": {"count": 4821}
+            }}),
+            || {
+                let e = block(nav().scan_status()).unwrap_err().to_string();
+                assert!(e.contains("scanning"), "{e}");
+            },
+        );
+    }
+
+    #[test]
+    fn music_folders_errors_when_id_is_the_wrong_shape() {
+        serve(
+            "/rest/getMusicFolders.view",
+            json!({"subsonic-response": {"status": "ok", "version": "1.16.1",
+                "musicFolders": {"musicFolder": [
+                    {"id": true, "name": "Music"}
+                ]}
+            }}),
+            || {
+                let e = block(nav().music_folders()).unwrap_err().to_string();
+                assert!(e.contains("id"), "{e}");
             },
         );
     }

@@ -27,6 +27,7 @@ use plugin_toolkit::service::{
 };
 
 pub mod api;
+mod md5;
 pub mod tools;
 
 /// navidrome backend. Holds only the provider name; the instance id and its
