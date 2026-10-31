@@ -59,6 +59,36 @@ pub struct NowPlayingEntry {
     pub minutes_ago: i64,
 }
 
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtistEntry {
+    pub id: String,
+    pub name: String,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumEntry {
+    pub id: String,
+    pub name: String,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SongEntry {
+    pub id: String,
+    pub title: String,
+}
+
+/// `search3.view` results, grouped the way Subsonic returns them.
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SearchResult {
+    pub artists: Vec<ArtistEntry>,
+    pub albums: Vec<AlbumEntry>,
+    pub songs: Vec<SongEntry>,
+}
+
 impl Navidrome {
     pub fn new(base_url: &str, username: &str, password: &str, insecure: bool) -> Result<Self> {
         let http = ApiClientBuilder::new().insecure(insecure).build()?;
@@ -159,6 +189,53 @@ impl Navidrome {
             .iter()
             .map(parse_now_playing_entry)
             .collect())
+    }
+
+    /// Every artist in the library (`getArtists.view`). Unlike album/song
+    /// listings, Subsonic returns the whole artist tree in one call — there is
+    /// no `size`/`offset` paging parameter for this endpoint.
+    pub async fn artists(&self) -> Result<Vec<ArtistEntry>> {
+        let v = self.call("getArtists.view", &[]).await?;
+        let mut out = Vec::new();
+        for idx in arr(&v["artists"]["index"]) {
+            for a in arr(&idx["artist"]) {
+                out.push(ArtistEntry {
+                    id: id_of(&a["id"]),
+                    name: str_of(&a["name"]),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Free-text search across artists/albums/songs (`search3.view`).
+    pub async fn search(&self, query: &str) -> Result<SearchResult> {
+        let extra = [("query", query.to_string())];
+        let v = self.call("search3.view", &extra).await?;
+        let r = &v["searchResult3"];
+        Ok(SearchResult {
+            artists: arr(&r["artist"])
+                .iter()
+                .map(|a| ArtistEntry {
+                    id: id_of(&a["id"]),
+                    name: str_of(&a["name"]),
+                })
+                .collect(),
+            albums: arr(&r["album"])
+                .iter()
+                .map(|a| AlbumEntry {
+                    id: id_of(&a["id"]),
+                    name: str_of(&a["name"]),
+                })
+                .collect(),
+            songs: arr(&r["song"])
+                .iter()
+                .map(|s| SongEntry {
+                    id: id_of(&s["id"]),
+                    title: str_of(&s["title"]),
+                })
+                .collect(),
+        })
     }
 }
 
@@ -374,6 +451,108 @@ mod tests {
             "/rest/getNowPlaying.view",
             json!({"subsonic-response": {"status": "ok", "version": "1.16.1"}}),
             || assert!(block(nav().now_playing()).unwrap().is_empty()),
+        );
+    }
+
+    #[test]
+    fn artists_flattens_the_index_tree() {
+        serve(
+            "/rest/getArtists.view",
+            json!({"subsonic-response": {"status": "ok", "version": "1.16.1",
+                "artists": {"index": [
+                    {"name": "A", "artist": [{"id": "ar_1", "name": "Aphex Twin"}]},
+                    {"name": "B", "artist": [
+                        {"id": "ar_2", "name": "Boards of Canada"},
+                        {"id": "ar_3", "name": "Burial"}
+                    ]}
+                ]}
+            }}),
+            || {
+                let artists = block(nav().artists()).unwrap();
+                assert_eq!(
+                    artists,
+                    vec![
+                        ArtistEntry {
+                            id: "ar_1".into(),
+                            name: "Aphex Twin".into()
+                        },
+                        ArtistEntry {
+                            id: "ar_2".into(),
+                            name: "Boards of Canada".into()
+                        },
+                        ArtistEntry {
+                            id: "ar_3".into(),
+                            name: "Burial".into()
+                        },
+                    ]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn artists_is_empty_for_an_empty_library() {
+        serve(
+            "/rest/getArtists.view",
+            json!({"subsonic-response": {"status": "ok", "version": "1.16.1",
+                "artists": {"index": []}
+            }}),
+            || assert!(block(nav().artists()).unwrap().is_empty()),
+        );
+    }
+
+    #[test]
+    fn search_parses_artists_albums_and_songs() {
+        let calls = serve(
+            "/rest/search3.view",
+            json!({"subsonic-response": {"status": "ok", "version": "1.16.1",
+                "searchResult3": {
+                    "artist": [{"id": "ar_1", "name": "Burial"}],
+                    "album": [{"id": "al_1", "name": "Untrue"}],
+                    "song": [{"id": "tr_1", "title": "Archangel"}]
+                }
+            }}),
+            || {
+                let r = block(nav().search("burial")).unwrap();
+                assert_eq!(
+                    r.artists,
+                    vec![ArtistEntry {
+                        id: "ar_1".into(),
+                        name: "Burial".into()
+                    }]
+                );
+                assert_eq!(
+                    r.albums,
+                    vec![AlbumEntry {
+                        id: "al_1".into(),
+                        name: "Untrue".into()
+                    }]
+                );
+                assert_eq!(
+                    r.songs,
+                    vec![SongEntry {
+                        id: "tr_1".into(),
+                        title: "Archangel".into()
+                    }]
+                );
+            },
+        );
+        assert!(calls[0].1.contains("query=burial"), "{calls:?}");
+    }
+
+    #[test]
+    fn search_is_empty_when_nothing_matches() {
+        serve(
+            "/rest/search3.view",
+            json!({"subsonic-response": {"status": "ok", "version": "1.16.1",
+                "searchResult3": {}
+            }}),
+            || {
+                let r = block(nav().search("nothing")).unwrap();
+                assert!(r.artists.is_empty());
+                assert!(r.albums.is_empty());
+                assert!(r.songs.is_empty());
+            },
         );
     }
 

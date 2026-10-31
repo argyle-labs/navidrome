@@ -14,6 +14,8 @@ use plugin_toolkit::prelude::*;
 
 use crate::api::{MusicFolder, Navidrome, NowPlayingEntry, ScanStatus, ServerInfo};
 
+use plugin_toolkit::media::{MediaBackend, MediaCapability, MediaError, MediaItem, MediaType};
+
 #[endpoint_resource(plugin = "navidrome")]
 pub struct NavidromeEndpoint {
     pub name: String,
@@ -96,6 +98,106 @@ async fn navidrome_now_playing(args: EndpointArgs, _ctx: &ToolCtx) -> Result<Vec
     connect(&args.name).await?.now_playing().await
 }
 
+/// `media` domain registration: navidrome serves (`ServedBy`) the `Music`
+/// type. Resolves the same connection as the `navidrome.*` tools above —
+/// the first enabled endpoint, since the trait carries no instance param.
+#[derive(Debug, Clone, Default)]
+pub struct NavidromeMedia;
+
+impl NavidromeMedia {
+    pub fn new() -> Self {
+        Self
+    }
+
+    async fn connect(&self) -> std::result::Result<Navidrome, MediaError> {
+        let rows = endpoint_db::list()
+            .map_err(|e| MediaError::Transport(format!("read endpoints: {e}")))?;
+        let ep = rows
+            .into_iter()
+            .filter(|r| r.enabled)
+            .min_by(|a, b| a.name.cmp(&b.name))
+            .ok_or_else(|| MediaError::NotFound("no enabled navidrome endpoint".into()))?;
+        connect(&ep.name)
+            .await
+            .map_err(|e| MediaError::Transport(format!("{e:#}")))
+    }
+}
+
+#[plugin_toolkit::orca_async]
+impl MediaBackend for NavidromeMedia {
+    fn name(&self) -> &str {
+        "navidrome"
+    }
+    fn media_type(&self) -> MediaType {
+        MediaType::Music
+    }
+    fn capabilities(&self) -> Vec<MediaCapability> {
+        vec![MediaCapability::ServedBy]
+    }
+    fn endpoint(&self) -> String {
+        String::new()
+    }
+
+    async fn list(&self) -> std::result::Result<Vec<MediaItem>, MediaError> {
+        list_items(&self.connect().await?).await
+    }
+
+    async fn search(&self, query: &str) -> std::result::Result<Vec<MediaItem>, MediaError> {
+        search_items(&self.connect().await?, query).await
+    }
+}
+
+/// Enumerate the library as `MediaItem`s (`getArtists.view`). Split from
+/// [`NavidromeMedia::list`] so the mapping is testable against a bare
+/// [`Navidrome`] client, without exercising endpoint resolution.
+async fn list_items(nav: &Navidrome) -> std::result::Result<Vec<MediaItem>, MediaError> {
+    let artists = nav
+        .artists()
+        .await
+        .map_err(|e| MediaError::Transport(format!("{e:#}")))?;
+    Ok(artists
+        .into_iter()
+        .map(|a| MediaItem {
+            id: a.id,
+            title: a.name,
+            status: None,
+            path: None,
+        })
+        .collect())
+}
+
+/// Free-text search mapped to `MediaItem`s (`search3.view`), artists then
+/// albums then songs.
+async fn search_items(
+    nav: &Navidrome,
+    query: &str,
+) -> std::result::Result<Vec<MediaItem>, MediaError> {
+    let r = nav
+        .search(query)
+        .await
+        .map_err(|e| MediaError::Transport(format!("{e:#}")))?;
+    let mut out = Vec::with_capacity(r.artists.len() + r.albums.len() + r.songs.len());
+    out.extend(r.artists.into_iter().map(|a| MediaItem {
+        id: a.id,
+        title: a.name,
+        status: None,
+        path: None,
+    }));
+    out.extend(r.albums.into_iter().map(|a| MediaItem {
+        id: a.id,
+        title: a.name,
+        status: None,
+        path: None,
+    }));
+    out.extend(r.songs.into_iter().map(|s| MediaItem {
+        id: s.id,
+        title: s.title,
+        status: None,
+        path: None,
+    }));
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +240,119 @@ mod tests {
             },
         );
         assert!(format!("{e:#}").contains("navidrome"), "{e:#}");
+    }
+
+    #[test]
+    fn media_facet_advertises_served_by_and_music() {
+        let m = NavidromeMedia::new();
+        assert_eq!(m.name(), "navidrome");
+        assert_eq!(m.media_type(), MediaType::Music);
+        assert_eq!(m.capabilities(), vec![MediaCapability::ServedBy]);
+    }
+
+    use plugin_toolkit::serde_json::{self, Value};
+    use std::sync::{Arc, Mutex};
+
+    type Call = (String, String);
+
+    fn serve<F>(path: &'static str, body: Value, f: F) -> Vec<Call>
+    where
+        F: FnOnce(),
+    {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        plugin_toolkit::capsink::with_cap_sink(
+            Box::new(move |cap: &str, req: &str| {
+                assert_eq!(cap, "http.request");
+                let req: Value = serde_json::from_str(req).unwrap();
+                let url = req["url"].as_str().unwrap().to_string();
+                let method = req["method"].as_str().unwrap().to_string();
+                let p = url.trim_start_matches("http://nav.test").to_string();
+                log.lock().unwrap().push((method.clone(), p.clone()));
+                let (status, resp) = if p.starts_with(path) {
+                    (200, body.to_string())
+                } else {
+                    (404, "Not Found".to_string())
+                };
+                Ok(json!({"status": status, "headers": [], "body": resp.into_bytes()}).to_string())
+            }),
+            f,
+        );
+        let out = seen.lock().unwrap().clone();
+        out
+    }
+
+    fn block<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn nav() -> Navidrome {
+        Navidrome::new("http://nav.test/", "admin", "s3cret", false).unwrap()
+    }
+
+    #[test]
+    fn list_items_maps_artists_to_media_items() {
+        let mut got = Vec::new();
+        serve(
+            "/rest/getArtists.view",
+            json!({"subsonic-response": {"status": "ok", "version": "1.16.1",
+                "artists": {"index": [
+                    {"name": "B", "artist": [{"id": "ar_1", "name": "Burial"}]}
+                ]}
+            }}),
+            || got = block(list_items(&nav())).unwrap(),
+        );
+        assert_eq!(
+            got,
+            vec![MediaItem {
+                id: "ar_1".into(),
+                title: "Burial".into(),
+                status: None,
+                path: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn search_items_orders_artists_then_albums_then_songs() {
+        serve(
+            "/rest/search3.view",
+            json!({"subsonic-response": {"status": "ok", "version": "1.16.1",
+                "searchResult3": {
+                    "artist": [{"id": "ar_1", "name": "Burial"}],
+                    "album": [{"id": "al_1", "name": "Untrue"}],
+                    "song": [{"id": "tr_1", "title": "Archangel"}]
+                }
+            }}),
+            || {
+                let items = block(search_items(&nav(), "burial")).unwrap();
+                assert_eq!(
+                    items,
+                    vec![
+                        MediaItem {
+                            id: "ar_1".into(),
+                            title: "Burial".into(),
+                            status: None,
+                            path: None,
+                        },
+                        MediaItem {
+                            id: "al_1".into(),
+                            title: "Untrue".into(),
+                            status: None,
+                            path: None,
+                        },
+                        MediaItem {
+                            id: "tr_1".into(),
+                            title: "Archangel".into(),
+                            status: None,
+                            path: None,
+                        },
+                    ]
+                );
+            },
+        );
     }
 }

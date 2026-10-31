@@ -15,6 +15,10 @@
 //!   `getScanStatus.view`.
 //! - `navidrome.now_playing` — who/what is currently streaming via
 //!   `getNowPlaying.view`.
+//!
+//! Also registers `NavidromeMedia` (`src/tools.rs`) as a `media` `served_by`
+//! backend for `Music`, so navidrome shows up through orca's generic
+//! cross-provider `media.*` tools alongside the bespoke tools above.
 #![allow(clippy::disallowed_types)]
 
 use plugin_toolkit::service::{
