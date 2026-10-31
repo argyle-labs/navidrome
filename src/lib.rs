@@ -1,15 +1,34 @@
 //! navidrome service backend — Music streaming (Subsonic API).
 //!
 //! Implements `ServiceBackend` so the generic `service.*` tools
-//! (deploy/backup/restore/configure/status/connect/sync) drive navidrome. No
-//! `#[orca_tool]`s — the only orca dep is `plugin-toolkit`. Modeled on the
-//! nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
+//! (deploy/backup/restore/configure/status/connect/sync) drive navidrome.
+//! Modeled on the nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
+//!
+//! Domain tool surface, over Navidrome's Subsonic API (`src/tools.rs` +
+//! `src/api.rs`):
+//!
+//! - `navidrome.server_info` — identity + protocol version from `ping.view`.
+//! - `navidrome.libraries` — configured music folders from
+//!   `getMusicFolders.view`.
+//! - `navidrome.library.scan` — trigger a rescan via `startScan.view`.
+//! - `navidrome.library.scan_status` — poll an in-progress scan via
+//!   `getScanStatus.view`.
+//! - `navidrome.now_playing` — who/what is currently streaming via
+//!   `getNowPlaying.view`.
+//!
+//! Also registers `NavidromeMedia` (`src/tools.rs`) as a `media` `served_by`
+//! backend for `Music`, so navidrome shows up through orca's generic
+//! cross-provider `media.*` tools alongside the bespoke tools above.
 #![allow(clippy::disallowed_types)]
 
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
     WorkloadSpec,
 };
+
+pub mod api;
+mod md5;
+pub mod tools;
 
 /// navidrome backend. Holds only the provider name; the instance id and its
 /// `Routes` come from the generic `service.*` tools on each op.
